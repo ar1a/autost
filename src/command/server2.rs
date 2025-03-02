@@ -1,6 +1,11 @@
+use crate::SETTINGS;
+
 use super::server::Server;
 use jane_eyre::eyre;
-use rocket::routes;
+use rocket::{
+    fs::{FileServer, Options},
+    Config,
+};
 
 /// - site routes (all under `base_url`)
 ///   - `GET <base_url>compose` (`compose_route`)
@@ -13,8 +18,17 @@ use rocket::routes;
 /// - `GET /` (`root_route`)
 /// - `<METHOD> <path>` (`not_found_route`)
 pub async fn main(args: Server) -> eyre::Result<()> {
-    let _rocket = rocket::build()
-        .mount("/hello", routes![world])
+    let port = args.port.unwrap_or(SETTINGS.server_port());
+    let _rocket = rocket::custom(Config::figment().merge(("port", port)))
+        .mount(
+            &SETTINGS.base_url,
+            FileServer::new(
+                "./site",
+                // DotFiles because attachments can start with a .
+                // NormalizeDirs because relative links rely on folders ending with a "/"
+                Options::Index | Options::DotFiles | Options::NormalizeDirs,
+            ),
+        )
         .launch()
         .await?;
 
