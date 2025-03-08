@@ -44,14 +44,16 @@ impl CachedFileResult<SitePath> {
     }
 }
 
-pub trait AttachmentsContext {
+pub(crate) trait AttachmentsContext {
     fn store(&self, input_path: &Path) -> eyre::Result<AttachmentsPath>;
-    fn cache_imported(&self, url: &str, post_basename: &str) -> eyre::Result<AttachmentsPath>;
-    fn cache_cohost_resource(
+    async fn cache_imported(&self, url: &str, post_basename: &str)
+        -> eyre::Result<AttachmentsPath>;
+    async fn cache_cohost_resource(
         &self,
         cacheable: &Cacheable,
     ) -> eyre::Result<CachedFileResult<AttachmentsPath>>;
-    fn cache_cohost_thumb(&self, id: &str) -> eyre::Result<CachedFileResult<AttachmentsPath>>;
+    async fn cache_cohost_thumb(&self, id: &str)
+        -> eyre::Result<CachedFileResult<AttachmentsPath>>;
 }
 
 pub struct RealAttachmentsContext;
@@ -69,7 +71,11 @@ impl AttachmentsContext for RealAttachmentsContext {
     }
 
     #[tracing::instrument(skip(self))]
-    fn cache_imported(&self, url: &str, post_basename: &str) -> eyre::Result<AttachmentsPath> {
+    async fn cache_imported(
+        &self,
+        url: &str,
+        post_basename: &str,
+    ) -> eyre::Result<AttachmentsPath> {
         let mut hash = Sha256::new();
         hash.update(url);
         let hash = hash.finalize().map(|o| format!("{o:02x}")).join("");
@@ -77,13 +83,13 @@ impl AttachmentsContext for RealAttachmentsContext {
         trace!(?path);
         create_dir_all(&path)?;
 
-        cache_imported_attachment(url, &path)
+        cache_imported_attachment(url, &path).await
     }
 
     #[tracing::instrument(skip(self))]
-    fn cache_cohost_resource(
+    async fn cache_cohost_resource(
         &self,
-        cacheable: &Cacheable,
+        cacheable: &Cacheable<'_>,
     ) -> eyre::Result<CachedFileResult<AttachmentsPath>> {
         match cacheable {
             Cacheable::Attachment { id, url } => {
@@ -92,7 +98,7 @@ impl AttachmentsContext for RealAttachmentsContext {
                 let path = dir.join(id)?;
                 create_dir_all(&path)?;
 
-                if cache_cohost_attachment(&redirect_url, &path, None)? {
+                if cache_cohost_attachment(&redirect_url, &path, None).await? {
                     Ok(CachedFileResult::CachedPath(cached_attachment_url(
                         id, dir,
                     )?))
@@ -109,7 +115,9 @@ impl AttachmentsContext for RealAttachmentsContext {
                 let path = dir.join(filename)?;
                 trace!(?path);
 
-                cache_other_cohost_resource(url, &path).map(CachedFileResult::CachedPath)
+                cache_other_cohost_resource(url, &path)
+                    .await
+                    .map(CachedFileResult::CachedPath)
             }
 
             Cacheable::Avatar { filename, url } => {
@@ -118,7 +126,9 @@ impl AttachmentsContext for RealAttachmentsContext {
                 let path = dir.join(filename)?;
                 trace!(?path);
 
-                cache_other_cohost_resource(url, &path).map(CachedFileResult::CachedPath)
+                cache_other_cohost_resource(url, &path)
+                    .await
+                    .map(CachedFileResult::CachedPath)
             }
 
             Cacheable::Header { filename, url } => {
@@ -127,13 +137,18 @@ impl AttachmentsContext for RealAttachmentsContext {
                 let path = dir.join(filename)?;
                 trace!(?path);
 
-                cache_other_cohost_resource(url, &path).map(CachedFileResult::CachedPath)
+                cache_other_cohost_resource(url, &path)
+                    .await
+                    .map(CachedFileResult::CachedPath)
             }
         }
     }
 
     #[tracing::instrument(skip(self))]
-    fn cache_cohost_thumb(&self, id: &str) -> eyre::Result<CachedFileResult<AttachmentsPath>> {
+    async fn cache_cohost_thumb(
+        &self,
+        id: &str,
+    ) -> eyre::Result<CachedFileResult<AttachmentsPath>> {
         fn thumb(url: &str) -> String {
             format!("{url}?width=675")
         }
@@ -143,7 +158,7 @@ impl AttachmentsContext for RealAttachmentsContext {
         let path = dir.join(id)?;
         create_dir_all(&path)?;
 
-        if cache_cohost_attachment(&redirect_url, &path, Some(thumb))? {
+        if cache_cohost_attachment(&redirect_url, &path, Some(thumb)).await? {
             Ok(CachedFileResult::CachedPath(cached_attachment_url(
                 id, dir,
             )?))
@@ -163,7 +178,10 @@ fn cached_attachment_url(id: &str, dir: &AttachmentsPath) -> eyre::Result<Attach
     Ok(path.join_dir_entry(&entry?)?)
 }
 
-fn cache_imported_attachment(url: &str, path: &AttachmentsPath) -> eyre::Result<AttachmentsPath> {
+async fn cache_imported_attachment(
+    url: &str,
+    path: &AttachmentsPath,
+) -> eyre::Result<AttachmentsPath> {
     // if the attachment id directory exists...
     if let Ok(mut entries) = read_dir(&path) {
         // and the directory contains a file...
@@ -184,7 +202,7 @@ fn cache_imported_attachment(url: &str, path: &AttachmentsPath) -> eyre::Result<
     trace!("cache miss");
     debug!("downloading attachment");
 
-    let response = reqwest::blocking::get(url)?;
+    let response = reqwest::get(url).await?;
     let extension = match response.headers().get("Content-Type") {
         Some(x) if x == "image/gif" => "gif",
         Some(x) if x == "image/jpeg" => "jpg",
@@ -199,7 +217,7 @@ fn cache_imported_attachment(url: &str, path: &AttachmentsPath) -> eyre::Result<
     let path = path.join(&format!("file.{extension}"))?;
     debug!(?path);
 
-    let result = response.bytes()?.to_vec();
+    let result = response.bytes().await?.to_vec();
     File::create(&path)?.write_all(&result)?;
 
     Ok(path)
@@ -213,7 +231,7 @@ fn cache_imported_attachment(url: &str, path: &AttachmentsPath) -> eyre::Result<
 ///
 /// returns true iff the attachment exists and was successfully retrieved or
 /// stored in the attachment store.
-fn cache_cohost_attachment(
+async fn cache_cohost_attachment(
     url: &str,
     path: &AttachmentsPath,
     transform_redirect_target: Option<fn(&str) -> String>,
@@ -238,7 +256,7 @@ fn cache_cohost_attachment(
     trace!("cache miss: {url}");
     debug!("downloading attachment");
 
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .redirect(Policy::none())
         .build()?;
 
@@ -246,7 +264,7 @@ fn cache_cohost_attachment(
     let mut wait = Duration::from_secs(4);
     let mut redirect;
     let url = loop {
-        let result = client.head(url).send();
+        let result = client.head(url).send().await;
         match result {
             Ok(response) => redirect = response,
             Err(error) => {
@@ -319,13 +337,16 @@ fn cache_cohost_attachment(
     };
 
     let path = path.join(original_filename.as_ref())?;
-    let result = reqwest::blocking::get(url)?.bytes()?.to_vec();
+    let result = reqwest::get(url).await?.bytes().await?.to_vec();
     File::create(&path)?.write_all(&result)?;
 
     Ok(true)
 }
 
-fn cache_other_cohost_resource(url: &str, path: &AttachmentsPath) -> eyre::Result<AttachmentsPath> {
+async fn cache_other_cohost_resource(
+    url: &str,
+    path: &AttachmentsPath,
+) -> eyre::Result<AttachmentsPath> {
     // if we can open the cached file...
     if let Ok(mut file) = File::open(path) {
         trace!("cache hit: {url}");
@@ -338,8 +359,8 @@ fn cache_other_cohost_resource(url: &str, path: &AttachmentsPath) -> eyre::Resul
     trace!("cache miss");
     debug!("downloading resource");
 
-    let response = reqwest::blocking::get(url)?;
-    let result = response.bytes()?.to_vec();
+    let response = reqwest::get(url).await?;
+    let result = response.bytes().await?.to_vec();
     File::create(path)?.write_all(&result)?;
 
     Ok(path.clone())

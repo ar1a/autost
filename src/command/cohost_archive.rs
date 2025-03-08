@@ -177,10 +177,11 @@ async fn archive_cohost_project(project_name: &str, archive_likes: bool) -> eyre
 
     if !exists("cohost2autost.done")? {
         info!("autost cohost2autost chosts");
-        crate::command::cohost2autost::main(Cohost2autost {
+        crate::command::cohost2autost::real_main(Cohost2autost {
             path_to_chosts: "chosts".to_owned(),
             specific_chost_filenames: vec![],
-        })?;
+        })
+        .await?;
         File::create("cohost2autost.done")?;
     }
 

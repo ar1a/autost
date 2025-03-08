@@ -8,6 +8,7 @@ use std::{
 };
 
 use askama::Template;
+use clap::Parser as _;
 use html5ever::{Attribute, QualName};
 use jane_eyre::eyre::{self, bail, eyre, Context};
 use markup5ever_rcdom::{Node, NodeData, RcDom};
@@ -26,7 +27,7 @@ use crate::{
     },
     migrations::run_migrations,
     path::{PostsPath, SitePath, POSTS_PATH_ROOT, SITE_PATH_ATTACHMENTS, SITE_PATH_THUMBS},
-    render_markdown, PostMeta,
+    render_markdown, Command, PostMeta,
 };
 
 #[derive(clap::Args, Debug)]
@@ -35,7 +36,16 @@ pub struct Cohost2autost {
     pub specific_chost_filenames: Vec<String>,
 }
 
-pub fn main(args: Cohost2autost) -> eyre::Result<()> {
+#[tokio::main]
+pub async fn main() -> eyre::Result<()> {
+    let Command::Cohost2autost(args) = Command::parse() else {
+        unreachable!("guaranteed by subcommand call in entry point")
+    };
+
+    real_main(args).await
+}
+
+pub async fn real_main(args: Cohost2autost) -> eyre::Result<()> {
     run_migrations()?;
 
     let input_path = Path::new(&args.path_to_chosts);
@@ -52,7 +62,7 @@ pub fn main(args: Cohost2autost) -> eyre::Result<()> {
     let span = tracing::Span::current();
     let results = dir_entries
         .into_par_iter()
-        .map(|entry| -> eyre::Result<()> {
+        .map(async |entry| -> eyre::Result<()> {
             // enter the main thread’s current span, if any, so that `autost cohost-archive` can
             // prefix logs with the project_name we’re currently converting chosts for.
             let _guard = span.enter();
@@ -70,13 +80,14 @@ pub fn main(args: Cohost2autost) -> eyre::Result<()> {
                 return Ok(());
             }
             convert_chost(&entry, &RealAttachmentsContext)
+                .await
                 .wrap_err_with(|| eyre!("{:?}: failed to convert", entry.path()))?;
             Ok(())
         })
         .collect::<Vec<_>>();
 
     for result in results {
-        result?;
+        result.await?;
     }
 
     trace!("saw html attributes: {:?}", debug_attributes_seen());
@@ -94,7 +105,7 @@ pub fn main(args: Cohost2autost) -> eyre::Result<()> {
 }
 
 #[tracing::instrument(level = "error", skip(context))]
-fn convert_chost(entry: &DirEntry, context: &dyn AttachmentsContext) -> eyre::Result<()> {
+async fn convert_chost(entry: &DirEntry, context: &impl AttachmentsContext) -> eyre::Result<()> {
     let input_path = entry.path();
 
     trace!("parsing");
@@ -115,20 +126,20 @@ fn convert_chost(entry: &DirEntry, context: &dyn AttachmentsContext) -> eyre::Re
     }
 
     for (shared_post, output_path) in shared_posts.into_iter().zip(shared_post_filenames.iter()) {
-        convert_single_chost(shared_post, vec![], &output_path, context)?;
+        convert_single_chost(shared_post, vec![], &output_path, context).await?;
     }
 
     let output_path = PostsPath::generated_post_path(post_id);
-    convert_single_chost(post, shared_post_filenames, &output_path, context)?;
+    convert_single_chost(post, shared_post_filenames, &output_path, context).await?;
 
     Ok(())
 }
 
-fn convert_single_chost(
+async fn convert_single_chost(
     post: Post,
     shared_post_filenames: Vec<PostsPath>,
     output_path: &PostsPath,
-    context: &dyn AttachmentsContext,
+    context: &impl AttachmentsContext,
 ) -> eyre::Result<()> {
     info!("writing: {output_path:?}");
     let mut output = File::create(output_path)?;
@@ -183,12 +194,12 @@ fn convert_single_chost(
         } {
             trace!("replacing blocks {start}..{end} with ast");
             let dom = process_ast(ast);
-            let html = process_chost_fragment(dom, context)?;
+            let html = process_chost_fragment(dom, context).await?;
             output.write_all(html.as_bytes())?;
             continue;
         }
 
-        let mut handle_attachment = |attachment| -> eyre::Result<()> {
+        let mut handle_attachment = async |attachment| -> eyre::Result<()> {
             match attachment {
                 Attachment::Image {
                     attachmentId,
@@ -198,9 +209,13 @@ fn convert_single_chost(
                 } => {
                     let template = CohostImgTemplate {
                         data_cohost_src: attachment_id_to_url(&attachmentId),
-                        thumb_src: context.cache_cohost_thumb(&attachmentId)?.site_path()?,
+                        thumb_src: context
+                            .cache_cohost_thumb(&attachmentId)
+                            .await?
+                            .site_path()?,
                         src: context
-                            .cache_cohost_resource(&Cacheable::attachment(&attachmentId, None))?
+                            .cache_cohost_resource(&Cacheable::attachment(&attachmentId, None))
+                            .await?
                             .site_path()?,
                         alt: altText,
                         width,
@@ -216,7 +231,8 @@ fn convert_single_chost(
                     let template = CohostAudioTemplate {
                         data_cohost_src: attachment_id_to_url(&attachmentId),
                         src: context
-                            .cache_cohost_resource(&Cacheable::attachment(&attachmentId, None))?
+                            .cache_cohost_resource(&Cacheable::attachment(&attachmentId, None))
+                            .await?
                             .site_path()?,
                         artist,
                         title,
@@ -232,11 +248,11 @@ fn convert_single_chost(
 
         match block {
             Block::Markdown { markdown } => {
-                let html = render_markdown_block(&markdown.content, context)?;
+                let html = render_markdown_block(&markdown.content, context).await?;
                 output.write_all(html.as_bytes())?;
                 continue;
             }
-            Block::Attachment { attachment } => handle_attachment(attachment)?,
+            Block::Attachment { attachment } => handle_attachment(attachment).await?,
             Block::Ask {
                 ask:
                     Ask {
@@ -245,7 +261,7 @@ fn convert_single_chost(
                         ..
                     },
             } => {
-                let html = render_markdown_block(&content, context)?;
+                let html = render_markdown_block(&content, context).await?;
                 let template = AskTemplate {
                     author: askingProject,
                     content: html,
@@ -256,7 +272,7 @@ fn convert_single_chost(
             Block::AttachmentRow { attachments } => {
                 for block in attachments {
                     match block {
-                        Block::Attachment { attachment } => handle_attachment(attachment)?,
+                        Block::Attachment { attachment } => handle_attachment(attachment).await?,
                         _ => warn!("AttachmentRow should only have Attachment blocks, but we got: {block:?}"),
                     }
                 }
@@ -359,156 +375,165 @@ struct AskTemplate {
     content: String,
 }
 
-fn render_markdown_block(markdown: &str, context: &dyn AttachmentsContext) -> eyre::Result<String> {
+async fn render_markdown_block(
+    markdown: &str,
+    context: &impl AttachmentsContext,
+) -> eyre::Result<String> {
     let html = render_markdown(markdown);
     let dom = parse_html_fragment(html.as_bytes())?;
 
-    process_chost_fragment(dom, context)
+    process_chost_fragment(dom, context).await
 }
 
-fn process_chost_fragment(
+async fn process_chost_fragment(
     mut dom: RcDom,
-    context: &dyn AttachmentsContext,
+    context: &impl AttachmentsContext,
 ) -> eyre::Result<String> {
     let mut transform = Transform::new(dom.document.clone());
-    while transform.next(|kids, new_kids| {
-        for kid in kids {
-            if let NodeData::Element { name, attrs, .. } = &kid.data {
-                // rewrite cohost attachment urls to relative cached paths.
-                let mut attrs = attrs.borrow_mut();
-                let mut extra_attrs = vec![];
-                if let Some(attr_names) = html_attributes_with_urls().get(name) {
-                    for attr in attrs.iter_mut() {
-                        if attr_names.contains(&attr.name) {
-                            let old_url = attr.value.to_str().to_owned();
-                            if let Some(cacheable) = Cacheable::from_url(&old_url) {
-                                trace!(
-                                    url = old_url,
-                                    "found cohost resource url in <{} {}>",
-                                    name.local,
-                                    attr.name.local
-                                );
-                                attr.value = context
-                                    .cache_cohost_resource(&cacheable)?
-                                    .site_path()?
-                                    .base_relative_url()
-                                    .into();
-                                extra_attrs.push(Attribute {
-                                    name: QualName::attribute(&format!(
-                                        "data-cohost-{}",
+    while transform
+        .next_async(async |kids, new_kids| {
+            for kid in kids {
+                if let NodeData::Element { name, attrs, .. } = &kid.data {
+                    // rewrite cohost attachment urls to relative cached paths.
+                    let mut attrs = attrs.borrow_mut();
+                    let mut extra_attrs = vec![];
+                    if let Some(attr_names) = html_attributes_with_urls().get(name) {
+                        for attr in attrs.iter_mut() {
+                            if attr_names.contains(&attr.name) {
+                                let old_url = attr.value.to_str().to_owned();
+                                if let Some(cacheable) = Cacheable::from_url(&old_url) {
+                                    trace!(
+                                        url = old_url,
+                                        "found cohost resource url in <{} {}>",
+                                        name.local,
                                         attr.name.local
-                                    )),
-                                    value: old_url.into(),
-                                });
+                                    );
+                                    attr.value = context
+                                        .cache_cohost_resource(&cacheable)
+                                        .await?
+                                        .site_path()?
+                                        .base_relative_url()
+                                        .into();
+                                    extra_attrs.push(Attribute {
+                                        name: QualName::attribute(&format!(
+                                            "data-cohost-{}",
+                                            attr.name.local
+                                        )),
+                                        value: old_url.into(),
+                                    });
+                                }
                             }
                         }
                     }
-                }
-                // rewrite cohost attachment urls in inline styles.
-                if let Some(style) = attrs.attr_mut("style") {
-                    let old_style = style.value.to_str();
-                    let mut has_any_cohost_attachment_urls = false;
-                    let mut tokens = vec![];
-                    for token in parse_inline_style(old_style) {
-                        tokens.push(match token {
-                            InlineStyleToken::Url(url) => {
-                                if let Some(cacheable) = Cacheable::from_url(&url) {
-                                    trace!(url, "found cohost resource url in inline style");
-                                    has_any_cohost_attachment_urls = true;
-                                    InlineStyleToken::Url(
-                                        context
-                                            .cache_cohost_resource(&cacheable)?
-                                            .site_path()?
-                                            .base_relative_url(),
-                                    )
-                                } else {
-                                    InlineStyleToken::Url(url)
+                    // rewrite cohost attachment urls in inline styles.
+                    if let Some(style) = attrs.attr_mut("style") {
+                        let old_style = style.value.to_str();
+                        let mut has_any_cohost_attachment_urls = false;
+                        let mut tokens = vec![];
+                        for token in parse_inline_style(old_style) {
+                            tokens.push(match token {
+                                InlineStyleToken::Url(url) => {
+                                    if let Some(cacheable) = Cacheable::from_url(&url) {
+                                        trace!(url, "found cohost resource url in inline style");
+                                        has_any_cohost_attachment_urls = true;
+                                        InlineStyleToken::Url(
+                                            context
+                                                .cache_cohost_resource(&cacheable)
+                                                .await?
+                                                .site_path()?
+                                                .base_relative_url(),
+                                        )
+                                    } else {
+                                        InlineStyleToken::Url(url)
+                                    }
                                 }
-                            }
-                            other => other,
+                                other => other,
+                            });
+                        }
+                        let new_style = serialise_inline_style(&tokens);
+                        if has_any_cohost_attachment_urls {
+                            trace!("old style: {old_style}");
+                            trace!("new style: {new_style}");
+                            style.value = new_style.into();
+                        }
+                    }
+                    // make all `<img>` elements lazy loaded.
+                    if name == &QualName::html("img") {
+                        extra_attrs.push(Attribute {
+                            name: QualName::attribute("loading"),
+                            value: "lazy".into(),
                         });
                     }
-                    let new_style = serialise_inline_style(&tokens);
-                    if has_any_cohost_attachment_urls {
-                        trace!("old style: {old_style}");
-                        trace!("new style: {new_style}");
-                        style.value = new_style.into();
+                    // rewrite `<Mention handle>` elements into ordinary links.
+                    if name == &QualName::html("Mention") {
+                        if let Some(handle) = attrs.attr_str("handle")? {
+                            let new_kid = create_element(&mut dom, "a");
+                            new_kid.children.replace(kid.children.take());
+                            let NodeData::Element { attrs, .. } = &new_kid.data else {
+                                bail!("irrefutable! guaranteed by create_element");
+                            };
+                            attrs.borrow_mut().push(Attribute {
+                                name: QualName::attribute("href"),
+                                value: format!("https://cohost.org/{handle}").into(),
+                            });
+                            new_kids.push(new_kid);
+                            continue;
+                        }
                     }
-                }
-                // make all `<img>` elements lazy loaded.
-                if name == &QualName::html("img") {
-                    extra_attrs.push(Attribute {
-                        name: QualName::attribute("loading"),
-                        value: "lazy".into(),
-                    });
-                }
-                // rewrite `<Mention handle>` elements into ordinary links.
-                if name == &QualName::html("Mention") {
-                    if let Some(handle) = attrs.attr_str("handle")? {
-                        let new_kid = create_element(&mut dom, "a");
+                    // rewrite `<CustomEmoji name url>` elements into ordinary images.
+                    if name == &QualName::html("CustomEmoji") {
+                        let name = attrs.attr_str("name")?;
+                        let url = attrs.attr_str("url")?;
+                        let new_kid = create_element(&mut dom, "img");
                         new_kid.children.replace(kid.children.take());
                         let NodeData::Element { attrs, .. } = &new_kid.data else {
                             bail!("irrefutable! guaranteed by create_element");
                         };
-                        attrs.borrow_mut().push(Attribute {
-                            name: QualName::attribute("href"),
-                            value: format!("https://cohost.org/{handle}").into(),
-                        });
+                        if let Some(name) = name {
+                            attrs.borrow_mut().push(Attribute {
+                                name: QualName::attribute("alt"),
+                                value: format!(":{name}:").into(),
+                            });
+                            attrs.borrow_mut().push(Attribute {
+                                name: QualName::attribute("title"),
+                                value: format!(":{name}:").into(),
+                            });
+                        }
+                        if let Some(url) = url {
+                            if let Some(cacheable) = Cacheable::from_url(url) {
+                                trace!(url, "found cohost resource url in <CustomEmoji url>");
+                                attrs.borrow_mut().push(Attribute {
+                                    name: QualName::attribute("src"),
+                                    value: context
+                                        .cache_cohost_resource(&cacheable)
+                                        .await?
+                                        .site_path()?
+                                        .base_relative_url()
+                                        .into(),
+                                });
+                            }
+                            attrs.borrow_mut().push(Attribute {
+                                name: QualName::attribute("data-cohost-url"),
+                                value: url.into(),
+                            });
+                        }
                         new_kids.push(new_kid);
                         continue;
                     }
+                    attrs.extend(extra_attrs);
                 }
-                // rewrite `<CustomEmoji name url>` elements into ordinary images.
-                if name == &QualName::html("CustomEmoji") {
-                    let name = attrs.attr_str("name")?;
-                    let url = attrs.attr_str("url")?;
-                    let new_kid = create_element(&mut dom, "img");
-                    new_kid.children.replace(kid.children.take());
-                    let NodeData::Element { attrs, .. } = &new_kid.data else {
-                        bail!("irrefutable! guaranteed by create_element");
-                    };
-                    if let Some(name) = name {
-                        attrs.borrow_mut().push(Attribute {
-                            name: QualName::attribute("alt"),
-                            value: format!(":{name}:").into(),
-                        });
-                        attrs.borrow_mut().push(Attribute {
-                            name: QualName::attribute("title"),
-                            value: format!(":{name}:").into(),
-                        });
-                    }
-                    if let Some(url) = url {
-                        if let Some(cacheable) = Cacheable::from_url(url) {
-                            trace!(url, "found cohost resource url in <CustomEmoji url>");
-                            attrs.borrow_mut().push(Attribute {
-                                name: QualName::attribute("src"),
-                                value: context
-                                    .cache_cohost_resource(&cacheable)?
-                                    .site_path()?
-                                    .base_relative_url()
-                                    .into(),
-                            });
-                        }
-                        attrs.borrow_mut().push(Attribute {
-                            name: QualName::attribute("data-cohost-url"),
-                            value: url.into(),
-                        });
-                    }
-                    new_kids.push(new_kid);
-                    continue;
-                }
-                attrs.extend(extra_attrs);
+                new_kids.push(kid.clone());
             }
-            new_kids.push(kid.clone());
-        }
-        Ok(())
-    })? {}
+            Ok(())
+        })
+        .await?
+    {}
 
     Ok(serialize_html_fragment(dom)?)
 }
 
-#[test]
-fn test_render_markdown_block() -> eyre::Result<()> {
+#[tokio::test]
+async fn test_render_markdown_block() -> eyre::Result<()> {
     use crate::path::{
         AttachmentsPath, ATTACHMENTS_PATH_COHOST_AVATAR, ATTACHMENTS_PATH_COHOST_HEADER,
         ATTACHMENTS_PATH_COHOST_STATIC, ATTACHMENTS_PATH_ROOT, ATTACHMENTS_PATH_THUMBS,
@@ -518,16 +543,16 @@ fn test_render_markdown_block() -> eyre::Result<()> {
         fn store(&self, _input_path: &Path) -> eyre::Result<AttachmentsPath> {
             unreachable!()
         }
-        fn cache_imported(
+        async fn cache_imported(
             &self,
             _url: &str,
             _post_basename: &str,
         ) -> eyre::Result<AttachmentsPath> {
             unreachable!();
         }
-        fn cache_cohost_resource(
+        async fn cache_cohost_resource(
             &self,
-            cacheable: &Cacheable,
+            cacheable: &Cacheable<'_>,
         ) -> eyre::Result<CachedFileResult<AttachmentsPath>> {
             Ok(CachedFileResult::CachedPath(match cacheable {
                 Cacheable::Attachment { id, .. } => ATTACHMENTS_PATH_ROOT.join(&format!("{id}"))?,
@@ -542,7 +567,10 @@ fn test_render_markdown_block() -> eyre::Result<()> {
                 }
             }))
         }
-        fn cache_cohost_thumb(&self, id: &str) -> eyre::Result<CachedFileResult<AttachmentsPath>> {
+        async fn cache_cohost_thumb(
+            &self,
+            id: &str,
+        ) -> eyre::Result<CachedFileResult<AttachmentsPath>> {
             Ok(CachedFileResult::CachedPath(
                 ATTACHMENTS_PATH_THUMBS.join(&format!("{id}"))?,
             ))
@@ -552,16 +580,16 @@ fn test_render_markdown_block() -> eyre::Result<()> {
     let n = "\n";
     let context = TestAttachmentsContext {};
     assert_eq!(
-        render_markdown_block("text", &context)?,
+        render_markdown_block("text", &context).await?,
         format!(r#"<p>text</p>{n}"#)
     );
-    assert_eq!(render_markdown_block("![text](https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444)", &context)?,
+    assert_eq!(render_markdown_block("![text](https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444)", &context).await?,
         format!(r#"<p><img src="attachments/44444444-4444-4444-4444-444444444444" alt="text" data-cohost-src="https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444" loading="lazy"></p>{n}"#));
-    assert_eq!(render_markdown_block("<img src=https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444>", &context)?,
+    assert_eq!(render_markdown_block("<img src=https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444>", &context).await?,
         format!(r#"<img src="attachments/44444444-4444-4444-4444-444444444444" data-cohost-src="https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444" loading="lazy">{n}"#));
-    assert_eq!(render_markdown_block("[text](https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444)", &context)?,
+    assert_eq!(render_markdown_block("[text](https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444)", &context).await?,
         format!(r#"<p><a href="attachments/44444444-4444-4444-4444-444444444444" data-cohost-href="https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444">text</a></p>{n}"#));
-    assert_eq!(render_markdown_block("<a href=https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444>text</a>", &context)?,
+    assert_eq!(render_markdown_block("<a href=https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444>text</a>", &context).await?,
         format!(r#"<p><a href="attachments/44444444-4444-4444-4444-444444444444" data-cohost-href="https://cohost.org/rc/attachment-redirect/44444444-4444-4444-4444-444444444444">text</a></p>{n}"#));
 
     Ok(())

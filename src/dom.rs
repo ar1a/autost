@@ -246,6 +246,23 @@ impl Transform {
             Ok(false)
         }
     }
+
+    pub async fn next_async(
+        &mut self,
+        f: impl AsyncFnOnce(&[Handle], &mut Vec<Handle>) -> eyre::Result<()>,
+    ) -> eyre::Result<bool> {
+        if let Some(node) = self.0.pop_front() {
+            let mut new_kids = vec![];
+            f(&node.children.borrow(), &mut new_kids).await?;
+            for kid in new_kids.iter() {
+                self.0.push_back(kid.clone());
+            }
+            node.children.replace(new_kids);
+            Ok(!self.0.is_empty())
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 pub trait HandleExt {

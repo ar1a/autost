@@ -78,7 +78,7 @@ pub async fn main() -> eyre::Result<()> {
     }
 
     let (path, file) = result.ok_or_eyre("too many posts :(")?;
-    write_post(file, meta, e_content, base_href, path)?;
+    write_post(file, meta, e_content, base_href, path).await?;
 
     Ok(())
 }
@@ -106,7 +106,7 @@ pub mod reimport {
 
         info!("updating existing post: {path:?}");
         let file = File::create(&path)?;
-        write_post(file, meta, e_content, base_href, path)?;
+        write_post(file, meta, e_content, base_href, path).await?;
 
         Ok(())
     }
@@ -304,13 +304,13 @@ async fn fetch_akkoma_post(
 
     Ok(Some(FetchPostResult {
         base_href: url.clone(),
-        content: content,
+        content,
         url,
         meta,
     }))
 }
 
-fn write_post(
+async fn write_post(
     mut file: File,
     meta: PostMeta,
     e_content: String,
@@ -321,7 +321,8 @@ fn write_post(
     file.write_all(meta.render()?.as_bytes())?;
     file.write_all(b"\n\n")?;
     let basename = path.basename().ok_or_eyre("path has no basename")?;
-    let unsafe_html = process_content(&e_content, basename, &base_href, &RealAttachmentsContext)?;
+    let unsafe_html =
+        process_content(&e_content, basename, &base_href, &RealAttachmentsContext).await?;
     let post = TemplatedPost::filter(&unsafe_html, Some(path.clone()))?;
     file.write_all(post.safe_html.as_bytes())?;
     info!("click here to reply: {}", path.compose_reply_url());
@@ -340,11 +341,11 @@ struct FetchPostResult {
     meta: PostMeta,
 }
 
-fn process_content(
+async fn process_content(
     content: &str,
     post_basename: &str,
     base_href: &Url,
-    context: &dyn AttachmentsContext,
+    context: &impl AttachmentsContext,
 ) -> eyre::Result<String> {
     let dom = parse_html_fragment(content.as_bytes())?;
 
@@ -365,7 +366,8 @@ fn process_content(
                                 attr.name.local
                             );
                             attr.value = context
-                                .cache_imported(&fetch_url.to_string(), post_basename)?
+                                .cache_imported(&fetch_url.to_string(), post_basename)
+                                .await?
                                 .site_path()?
                                 .base_relative_url()
                                 .into();
