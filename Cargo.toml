@@ -31,7 +31,7 @@ html5ever = "0.27.0"
 http = "0.2.12"
 indexmap = { version = "2.7.0", features = ["serde"] }
 jane-eyre = "0.3.0"
-markup5ever_rcdom = "0.3.0"
+markup5ever_arcdom = "0.1.2"
 rayon = "1.10.0"
 renamore = "0.3.2"
 rocket = { version = "0.5.1", features = ["json"] }

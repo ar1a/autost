@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs::create_dir_all};
 
 use html5ever::QualName;
 use jane_eyre::eyre::{self, bail, OptionExt};
-use markup5ever_rcdom::NodeData;
+use markup5ever_arcdom::NodeData;
 use tracing::trace;
 
 use crate::{

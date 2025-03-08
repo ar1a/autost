@@ -14,7 +14,7 @@ use html5ever::{
     Attribute, LocalName, Namespace, ParseOpts,
 };
 use jane_eyre::eyre::{self, bail};
-use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
+use markup5ever_arcdom::{ArcDom, Handle, NodeData, SerializableHandle};
 use serde_json::Value;
 use tracing::{error, warn};
 use xml5ever::driver::XmlParseOpts;
@@ -352,7 +352,7 @@ pub trait QualNameExt {
 }
 impl QualNameExt for QualName {}
 
-pub fn parse_html_fragment(mut input: &[u8]) -> eyre::Result<RcDom> {
+pub fn parse_html_fragment(mut input: &[u8]) -> eyre::Result<ArcDom> {
     let options = ParseOpts {
         tree_builder: TreeBuilderOpts {
             drop_doctype: true,
@@ -361,34 +361,34 @@ pub fn parse_html_fragment(mut input: &[u8]) -> eyre::Result<RcDom> {
         ..Default::default()
     };
     let context = QualName::new(None, ns!(html), local_name!("section"));
-    let dom = html5ever::parse_fragment(RcDom::default(), options, context, vec![])
+    let dom = html5ever::parse_fragment(ArcDom::default(), options, context, vec![])
         .from_utf8()
         .read_from(&mut input)?;
 
     Ok(dom)
 }
 
-pub fn parse_html_document(mut input: &[u8]) -> eyre::Result<RcDom> {
-    let dom = html5ever::parse_document(RcDom::default(), ParseOpts::default())
+pub fn parse_html_document(mut input: &[u8]) -> eyre::Result<ArcDom> {
+    let dom = html5ever::parse_document(ArcDom::default(), ParseOpts::default())
         .from_utf8()
         .read_from(&mut input)?;
 
     Ok(dom)
 }
 
-pub fn parse_xml(mut input: &[u8]) -> eyre::Result<RcDom> {
-    let dom = xml5ever::driver::parse_document(RcDom::default(), XmlParseOpts::default())
+pub fn parse_xml(mut input: &[u8]) -> eyre::Result<ArcDom> {
+    let dom = xml5ever::driver::parse_document(ArcDom::default(), XmlParseOpts::default())
         .from_utf8()
         .read_from(&mut input)?;
 
     Ok(dom)
 }
 
-pub fn serialize_html_document(dom: RcDom) -> eyre::Result<String> {
+pub fn serialize_html_document(dom: ArcDom) -> eyre::Result<String> {
     serialize_node_contents(dom.document.clone())
 }
 
-pub fn serialize_html_fragment(dom: RcDom) -> eyre::Result<String> {
+pub fn serialize_html_fragment(dom: ArcDom) -> eyre::Result<String> {
     // html5ever::parse_fragment builds a tree with the input wrapped in an <html> element.
     // this is consistent with how the web platform dom requires exactly one root element.
     let children = dom.document.children.borrow();
@@ -419,23 +419,23 @@ pub fn serialize_node_contents(node: Handle) -> eyre::Result<String> {
 #[test]
 fn test_serialize() -> eyre::Result<()> {
     assert_eq!(
-        serialize_html_fragment(RcDom::default()).map_err(|_| ()),
+        serialize_html_fragment(ArcDom::default()).map_err(|_| ()),
         Err(())
     );
 
-    let mut dom = RcDom::default();
+    let mut dom = ArcDom::default();
     let html = create_element(&mut dom, "html");
     dom.document.children.borrow_mut().push(html);
     assert_eq!(serialize_html_fragment(dom)?, "");
 
-    let mut dom = RcDom::default();
+    let mut dom = ArcDom::default();
     let html = create_element(&mut dom, "html");
     dom.document.children.borrow_mut().push(html);
     let html = create_element(&mut dom, "html");
     dom.document.children.borrow_mut().push(html);
     assert_eq!(serialize_html_fragment(dom).map_err(|_| ()), Err(()));
 
-    let mut dom = RcDom::default();
+    let mut dom = ArcDom::default();
     let html = create_element(&mut dom, "p");
     dom.document.children.borrow_mut().push(html);
     assert_eq!(serialize_html_fragment(dom).map_err(|_| ()), Err(()));
@@ -443,16 +443,16 @@ fn test_serialize() -> eyre::Result<()> {
     Ok(())
 }
 
-/// create a [`RcDom`] whose document has exactly one child, a wrapper <html> element.
-pub fn create_fragment() -> (RcDom, Handle) {
-    let mut dom = RcDom::default();
+/// create a [`ArcDom`] whose document has exactly one child, a wrapper <html> element.
+pub fn create_fragment() -> (ArcDom, Handle) {
+    let mut dom = ArcDom::default();
     let root = create_element(&mut dom, "html");
     dom.document.children.borrow_mut().push(root.clone());
 
     (dom, root)
 }
 
-pub fn create_element(dom: &mut RcDom, html_local_name: &str) -> Handle {
+pub fn create_element(dom: &mut ArcDom, html_local_name: &str) -> Handle {
     let name = QualName::html(html_local_name);
     dom.create_element(name, vec![], ElementFlags::default())
 }
